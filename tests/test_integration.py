@@ -8,18 +8,26 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-_TMP = tempfile.mkdtemp(prefix="battery-test-")
-_DB = os.path.join(_TMP, "test.db")
-for _suffix in ("", "-wal", "-shm"):
-    try:
-        os.remove(_DB + _suffix)
-    except FileNotFoundError:
-        pass
-os.environ["BATTERY_DB_PATH"] = _DB
+# One process-wide database shared with test_diff_api: the app singleton is
+# created once per process; distinct cell IDs keep the suites isolated.
+_DB = os.environ.setdefault(
+    "BATTERY_DB_PATH",
+    os.path.join(tempfile.mkdtemp(prefix="battery-shared-"), "shared.db"),
+)
+if not os.path.exists(_DB):
+    for _suffix in ("", "-wal", "-shm"):
+        try:
+            os.remove(_DB + _suffix)
+        except FileNotFoundError:
+            pass
 
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
+from app.db import Database  # noqa: E402
+
+# Re-point the shared app singleton at the shared database.
+app.db = Database(_DB)
 
 
 def csv_text(rows, header="timestamp,current\n"):

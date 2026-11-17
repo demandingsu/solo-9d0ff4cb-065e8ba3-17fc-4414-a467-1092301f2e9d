@@ -5,9 +5,10 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import contextmanager
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Tuple
 
-from .algorithm import Cycle, detect_cycles
+from .algorithm import detect_cycles
+from .diff import diff_cycles
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cells (
@@ -42,6 +43,31 @@ CREATE TABLE IF NOT EXISTS cycles (
     PRIMARY KEY (cell_id, version, cycle_no)
 );
 
+-- One row per *successful* import, in the same transaction as the report
+-- version it produced. A pure idempotent re-upload still gets a row; its
+-- increment simply contains zero samples. Versions created before this
+-- table existed have no row and are reported as 'unknown'.
+CREATE TABLE IF NOT EXISTS upload_batches (
+    cell_id      TEXT NOT NULL,
+    version      INTEGER NOT NULL,
+    inserted     INTEGER NOT NULL,
+    duplicate    INTEGER NOT NULL,
+    increment_status TEXT NOT NULL DEFAULT 'known',
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (cell_id, version)
+);
+
+-- The exact samples that were newly stored by the import of (cell, version).
+-- An empty result set means 'known to be empty' (pure re-upload), which is
+-- different from a missing upload_batches row ('unknown').
+CREATE TABLE IF NOT EXISTS sample_increments (
+    cell_id      TEXT NOT NULL,
+    version      INTEGER NOT NULL,
+    ts           INTEGER NOT NULL,
+    current_ma   INTEGER NOT NULL,
+    PRIMARY KEY (cell_id, version, ts)
+);
+
 CREATE TABLE IF NOT EXISTS upload_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     cell_id      TEXT NOT NULL,
@@ -66,6 +92,15 @@ class ConflictError(Exception):
 
 class ImportError_(Exception):
     """Generic import failure (bad CSV payload etc.)."""
+
+
+class VersionNotFound(Exception):
+    """The requested report version does not exist for this cell."""
+
+    def __init__(self, cell_id: str, version: int):
+        self.cell_id = cell_id
+        self.version = version
+        super().__init__(f"version {version} not found for cell {cell_id}")
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -146,14 +181,17 @@ class Database:
 
             inserted = 0
             duplicate = 0
+            inserted_rows: list[tuple[int, int]] = []
             for ts, current in incoming:
+                stored = _to_storage(current)
                 cur = conn.execute(
                     "INSERT OR IGNORE INTO samples(cell_id, ts, current_ma)"
                     " VALUES(?,?,?)",
-                    (cell_id, ts, _to_storage(current)),
+                    (cell_id, ts, stored),
                 )
                 if cur.rowcount:
                     inserted += 1
+                    inserted_rows.append((ts, stored))
                 else:
                     duplicate += 1
 
@@ -201,6 +239,20 @@ class Database:
                     for c in cycles
                 ],
             )
+            # Persist the sample increment together with the new report in
+            # the same transaction: either both are visible or neither is.
+            # A pure re-upload still gets a batch row (empty increment).
+            conn.execute(
+                "INSERT INTO upload_batches(cell_id, version, inserted,"
+                " duplicate, increment_status) VALUES(?,?,?,?,'known')",
+                (cell_id, version, inserted, duplicate),
+            )
+            if inserted_rows:
+                conn.executemany(
+                    "INSERT INTO sample_increments(cell_id, version, ts,"
+                    " current_ma) VALUES(?,?,?,?)",
+                    [(cell_id, version, ts, ma) for ts, ma in inserted_rows],
+                )
             conn.execute(
                 "INSERT INTO upload_log(cell_id, status, detail) VALUES(?,?,?)",
                 (cell_id, "accepted", f"version={version}"),
@@ -289,6 +341,139 @@ class Database:
                 " ORDER BY c.cell_id"
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # Adjacent-version diff
+    # ------------------------------------------------------------------ #
+    def get_version_diff(self, cell_id: str, to_version: int) -> Optional[dict]:
+        """Compare report ``to_version`` against its immediate predecessor.
+
+        Everything (both report versions, their cycle details and both
+        sample increments) is read inside one snapshot transaction, so the
+        answer always belongs to a single committed state even while uploads
+        are committing concurrently.
+
+        Returns None when the cell is unknown; raises VersionNotFound when
+        the cell exists but the requested version does not.
+        """
+        conn = _connect(self.db_path)
+        try:
+            conn.execute("BEGIN")  # deferred read snapshot (WAL)
+            try:
+                cell = conn.execute(
+                    "SELECT cell_id FROM cells WHERE cell_id=?", (cell_id,)
+                ).fetchone()
+                if cell is None:
+                    return None
+
+                to_ver = conn.execute(
+                    "SELECT version, total_cycles, created_at FROM"
+                    " report_versions WHERE cell_id=? AND version=?",
+                    (cell_id, to_version),
+                ).fetchone()
+                if to_ver is None:
+                    raise VersionNotFound(cell_id, to_version)
+
+                from_version = to_version - 1
+                old_cycles: List[dict] = []
+                from_created_at = None
+                if from_version >= 1:
+                    from_ver = conn.execute(
+                        "SELECT version, total_cycles, created_at FROM"
+                        " report_versions WHERE cell_id=? AND version=?",
+                        (cell_id, from_version),
+                    ).fetchone()
+                    if from_ver is None:
+                        raise VersionNotFound(cell_id, from_version)
+                    from_created_at = from_ver["created_at"]
+                    old_rows = conn.execute(
+                        "SELECT cycle_no, charge_ah, discharge_ah,"
+                        " started_at, ended_at FROM cycles WHERE cell_id=?"
+                        " AND version=? ORDER BY cycle_no ASC",
+                        (cell_id, from_version),
+                    ).fetchall()
+                    old_cycles = [dict(r) for r in old_rows]
+
+                new_rows = conn.execute(
+                    "SELECT cycle_no, charge_ah, discharge_ah, started_at,"
+                    " ended_at FROM cycles WHERE cell_id=? AND version=?"
+                    " ORDER BY cycle_no ASC",
+                    (cell_id, to_version),
+                ).fetchall()
+                new_cycles = [dict(r) for r in new_rows]
+
+                result = diff_cycles(old_cycles, new_cycles)
+                return {
+                    "cell_id": cell_id,
+                    "from_version": from_version,
+                    "to_version": to_version,
+                    "from_created_at": from_created_at,
+                    "to_created_at": to_ver["created_at"],
+                    "from_increment": self._load_increment(
+                        conn, cell_id, from_version
+                    ),
+                    "to_increment": self._load_increment(
+                        conn, cell_id, to_version
+                    ),
+                    **result,
+                }
+            finally:
+                conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _load_increment(
+        conn: sqlite3.Connection, cell_id: str, version: int
+    ) -> dict:
+        """Increment view for a version.
+
+        version 0 (empty baseline) and versions with an upload_batches row
+        are 'known'. Legacy versions without a batch row are 'unknown':
+        ``samples`` is None and must never be read as an empty increment.
+        """
+        if version <= 0:
+            return {
+                "version": 0,
+                "status": "known",
+                "inserted": 0,
+                "duplicate": 0,
+                "samples": [],
+                "note": "empty baseline before the first upload",
+            }
+        batch = conn.execute(
+            "SELECT inserted, duplicate, increment_status FROM upload_batches"
+            " WHERE cell_id=? AND version=?",
+            (cell_id, version),
+        ).fetchone()
+        if batch is None:
+            return {
+                "version": version,
+                "status": "unknown",
+                "inserted": None,
+                "duplicate": None,
+                "samples": None,
+                "note": (
+                    "this version predates sample-increment tracking; the"
+                    " number of late points is unknown, not zero"
+                ),
+            }
+        rows = conn.execute(
+            "SELECT ts, current_ma FROM sample_increments WHERE cell_id=?"
+            " AND version=? ORDER BY ts ASC",
+            (cell_id, version),
+        ).fetchall()
+        return {
+            "version": version,
+            "status": batch["increment_status"],
+            "inserted": batch["inserted"],
+            "duplicate": batch["duplicate"],
+            "samples": [
+                {"ts": r["ts"], "current_a": r["current_ma"] / 1_000_000.0}
+                for r in rows
+            ],
+            "note": None,
+        }
 
 
 def _to_storage(current_a: float) -> int:

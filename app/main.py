@@ -5,10 +5,10 @@ from __future__ import annotations
 import os
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .csv_import import CSVParseError, parse_samples_csv
-from .db import ConflictError, Database, ImportError_
+from .db import ConflictError, Database, ImportError_, VersionNotFound
 
 DB_PATH = os.environ.get("BATTERY_DB_PATH", "/data/battery.db")
 
@@ -47,6 +47,77 @@ class UploadOut(BaseModel):
     duplicate: int
     version: int
     total_cycles: int
+
+
+class IncrementSample(BaseModel):
+    ts: int
+    current_a: float
+
+
+class IncrementInfo(BaseModel):
+    version: int
+    status: str  # 'known' (batch row exists) or 'unknown' (legacy version)
+    inserted: int | None
+    duplicate: int | None
+    samples: list[IncrementSample] | None
+    note: str | None
+
+
+class CyclePair(BaseModel):
+    old: CycleOut
+    new: CycleOut
+
+
+class CapacityChangeOut(CyclePair):
+    span_changed: bool
+    charge_delta_ah: float
+    discharge_delta_ah: float
+
+
+class SplitOut(BaseModel):
+    from_: CycleOut = Field(alias="from")
+    into: list[CycleOut]
+
+
+class MergeOut(BaseModel):
+    from_: list[CycleOut] = Field(alias="from")
+    into: CycleOut
+
+
+class RestructuredOut(BaseModel):
+    from_: list[CycleOut] = Field(alias="from")
+    into: list[CycleOut]
+
+
+class DiffSummary(BaseModel):
+    old_total: int
+    new_total: int
+    added: int
+    removed: int
+    split: int
+    merged: int
+    capacity_changed: int
+    unchanged: int
+    renumber_only: int
+    restructured: int
+
+
+class VersionDiffOut(BaseModel):
+    cell_id: str
+    from_version: int
+    to_version: int
+    from_created_at: str | None
+    to_created_at: str | None
+    from_increment: IncrementInfo
+    to_increment: IncrementInfo
+    added: list[CycleOut]
+    removed: list[CycleOut]
+    split: list[SplitOut]
+    merged: list[MergeOut]
+    capacity_changed: list[CapacityChangeOut]
+    unchanged: list[CyclePair]
+    restructured: list[RestructuredOut]
+    summary: DiffSummary
 
 
 @app.post(
@@ -91,6 +162,32 @@ def get_report(cell_id: str):
     if report is None:
         raise HTTPException(status_code=404, detail=f"unknown cell {cell_id}")
     return report
+
+
+@app.get(
+    "/cells/{cell_id}/versions/{version}/diff",
+    response_model=VersionDiffOut,
+    tags=["query"],
+    summary=(
+        "Diff one report version against its immediate predecessor, with the"
+        " sample increments of both versions"
+    ),
+)
+def get_version_diff(cell_id: str, version: int):
+    if version < 1:
+        raise HTTPException(
+            status_code=400, detail="version must be a positive integer"
+        )
+    try:
+        diff = db.get_version_diff(cell_id, version)
+    except VersionNotFound as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        ) from exc
+    if diff is None:
+        raise HTTPException(status_code=404, detail=f"unknown cell {cell_id}")
+    return diff
 
 
 @app.get("/health", tags=["ops"], summary="Liveness probe")
